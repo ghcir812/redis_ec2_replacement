@@ -1,0 +1,606 @@
+#!/usr/bin/env bash
+
+USER="rich"
+USE_DB="YES"
+DBPATH="/Users/rich.goldstein/Databases/Sqlite/Redis_Upgrades/"
+DBNAME="urits.sqlite3"
+INPUT="urit_input.txt"
+LOGFILE="output.log"
+FLAVOR="r5.xlarge"
+EBS="true"
+EBS_SIZE="60"
+PATH_TO_ABOPS="../.."
+BOOTSTRAP_CMD="bin/bootstraps/ec2/redis_slave_1604.sh"
+IS_SIDEKIQ=""
+REDIS_PORT="26379"
+
+usage() {
+  echo "time:(${t}) - please do not run this script between 5pm and 6pm or 5 minutes before or after the hour or half hour"
+  exit
+}
+
+
+input_info() {
+  read -r OLDNODENAME NEWNODENAME < $INPUT
+  echo "OLDNAME=${OLDNODENAME}"
+  echo "NEWNAME=${NEWNODENAME}"
+}
+
+# based on the subnet, what availability zone am I in?
+
+check_az() {
+  sn=$1
+
+  case ${sn} in
+    subnet-xxxxxxxx)
+      availability_zone="us-east-1a"
+      ;;
+    subnet-xxxxxxxx)
+      availability_zone="us-east-1c"
+      ;;
+    subnet-xxxxxxxx)
+      availability_zone="us-east-1d"
+      ;;
+    subnet-xxxxxxxx)
+      availability_zone="eu-central-1a"
+      ;;
+    subnet-xxxxxxxx)
+      availability_zone="eu-central-1b"
+      ;;
+    *)
+      availability_zone="unknown"
+      ;;
+  esac
+
+  AZ_NAME=${availability_zone}
+}
+
+
+waiting() {
+  msg=$1
+  time=$2
+
+  echo "${msg}"
+  sleep "${time}"
+}
+
+
+sentinel_hosts() {
+  SENTINEL_HOSTS=()
+  while IFS= read -r line; do
+    SENTINEL_HOSTS+=( "$line" )
+  done < <( knife search node "roles:sentinel_monitor AND chef_environment:${ENVIRON}" -a ${customer}.access_ip 2>/dev/null | grep access_ip| tr -d ' '| cut -f2 -d ':' )
+
+  idx=$RANDOM
+  let "idx %= 3"
+  SH=${SENTINEL_HOSTS[idx]}
+  SL=$(echo "${SENTINEL_HOSTS[*]}")
+}
+
+
+change_subnet_id() {
+  local n_subnet_id
+  local yorn
+
+  echo "    (current) SUBNET_ID == ${REDIS_SLAVE_AZ}"
+  read -p "    enter NEW value for SUBNET_ID: " n_subnet_id
+  read -p "    >>>${n_subnet_id}<<<: do you want to use this new value? " yorn
+  echo ""
+  if [[ $yorn == "y" ]] || [[ $yorn == "Y" ]]; then
+    SUBNET_ID=${n_subnet_id}
+  fi
+}
+
+
+change_redis_slave_az() {
+  local n_redis_slave_az
+  local yorn
+
+  echo "    (current) REDIS_SLAVE_AZ == ${REDIS_SLAVE_AZ}"
+  read -p "    enter NEW value for REDIS_SLAVE_AZ: " n_redis_slave_az
+  read -p "    >>>${n_redis_slave_az}<<<: do you want to use this new value? " yorn
+  echo ""
+  if [[ $yorn == "y" ]] || [[ $yorn == "Y" ]]; then
+    REDIS_SLAVE_AZ=${n_redis_slave_az}
+  fi
+}
+
+
+change_ebs_size() {
+  local n_ebs_size
+  local yorn
+
+  echo "    (current) EBS_SIZE == ${EBS_SIZE}"
+  read -p "    enter NEW value for EBS_SIZE: " n_ebs_size
+  read -p "    >>>${n_ebs_size}<<<: do you want to use this new value? " yorn
+  echo ""
+  if [[ $yorn == "y" ]] || [[ $yorn == "Y" ]]; then
+    EBS_SIZE=${n_ebs_size}
+  fi
+}
+
+
+change_flavor() {
+  local nflavor
+  local yorn
+
+  echo "    (current) FLAVOR == ${FLAVOR}"
+  read -p "    enter NEW value for FLAVOR: " nflavor
+  read -p "    >>>${nflavor}<<<: do you want to use this new value? " yorn
+  echo ""
+  if [[ $yorn == "y" ]] || [[ $yorn == "Y" ]]; then
+    FLAVOR=${nflavor}
+  fi
+}
+
+
+override_menu() {
+  CMD="FLAVOR=$FLAVOR EBS=$EBS EBS_SIZE=$EBS_SIZE REDIS_SLAVE_AZ=$REDIS_SLAVE_AZ SLAVE_SUB=$SUBNET_ID $PATH_TO_ABOPS/$BOOTSTRAP_CMD $NAME $ENVIRON $SHARD"
+  echo $CMD
+  echo ""
+  echo "    FLAVOR         = ${FLAVOR}"
+  echo "    EBS_SIZE       = ${EBS_SIZE}"
+  echo "    REDIS_SLAVE_AZ = ${REDIS_SLAVE_AZ}"
+  echo "    SLAVE_SUB      = ${SUBNET_ID}"
+  echo ""
+
+  echo " 0. break/everything looks good now"
+  echo " 1. change FLAVOR/Instance type"
+  echo " 2. change EBS Size"
+  echo " 3. change Redis Slave AZ"
+  echo " 4. change Slave Subnet ID"
+}
+
+
+get_override_options() {
+  local choice
+  local nflavor
+  BREAKOUT="NO"
+
+  read -p "enter your choice..." choice
+  echo ""
+  case $choice in
+    0)
+       BREAKOUT="YES"
+       break
+       ;;
+    1)
+       # CHANGE FLAVOR
+       change_flavor
+       ;;
+    2)
+       # CHANGE EBS_SIZE
+       change_ebs_size
+       ;;
+    3)
+       # CHANGE REDIS_SLAVE_AZ
+       change_redis_slave_az
+       ;;
+    4)
+       # CHANGE SUBNET_ID
+       change_subnet_id
+       ;;
+    *) echo "error...unknown..." && sleep 2
+  esac
+}
+
+
+override_bootstrap_command() {
+  local yorn
+  BREAKOUT="YES"
+
+  echo "    Bootstrap Command: ${CMD}"
+  read -p  "    do you want to change any of these values? " yorn
+  echo ""
+
+  if [[ $yorn == "Y" ]] || [[ $yorn == "y" ]]; then
+    SAVED_CMD=$CMD
+    while (True)
+    do
+      override_menu
+      get_override_options
+    done
+  fi
+}
+
+
+display_data() {
+  sqlite3 $DBPATH$DBNAME "select * from updateinfo"
+}
+
+
+insert_data() {
+  if [[ ${IS_SIDEKIQ} == "YES" ]]; then
+    sk=1
+  else
+    sk=0
+  fi
+  sqlite3 $DBPATH$DBNAME  <<EOF
+  INSERT INTO updateinfo ("oldnodename", "newnodename", "environment", "tags", "availability_zone", "subnet_id", "is_sidekiq", "shard", "oldipaddr", "newipaddr", "use_sentinel_host", "sentinel_host_list")
+  VALUES ("$OLDNODENAME", "$NEWNODENAME", "$ENVIRON", "$TAGS", "$REDIS_SLAVE_AZ", "$SUBNET_ID", "$sk", "$SHARD", "$OLDIPADDR", "$NEWIPADDR", "$SH", "$SL");
+EOF
+}
+
+
+display_info() {
+  echo " execution started at: ${currenttime}"
+  echo "=============================================================="
+  echo "$NODEINFO"
+  echo "=============================================================="
+  check_az $SUBNET_ID
+  echo "        UserId:              $USER"
+  echo "        Node:                $OLDNODENAME"
+  echo "        InstanceId:          $INSTANCE_ID"
+  echo "        Instance Type (Old): $OLD_INSTANCE_TYPE"
+  echo "	New:                 $NEWNODENAME"
+  echo "        Node / Domain:       $NAME / $DOMAIN"
+  echo "	Environ:             $ENVIRON"
+  echo "	Tags:                $TAGS"
+  echo "	Availability Zone:   $REDIS_SLAVE_AZ"
+  echo "        Subnet AZ:           $AZ_NAME"
+  echo "        Subnet:              $SUBNET_ID"
+  echo "	Shard:               $SHARD"
+  echo "        IS_SideKiq:          $IS_SIDEKIQ"
+  echo "        IPAddr (Old):        $OLDIPADDR"
+  echo "        IPAddr (New):        $NEWIPADDR"
+  echo "        Instance Type (New): $FLAVOR"
+  echo "        Sentinel Host:       $SH"
+  echo "        Sentinel Hosts:      $SL"
+  echo ""
+}
+
+
+nodeinfo() {
+  nodename=$1
+  IFS='.' read -r NAME DOMAIN <<< "$NEWNODENAME"
+  NODEINFO=$(knife search $nodename 2>/dev/null)
+  ENVIRON=$(echo $NODEINFO | awk -F"Environment: " '{print $2}' | awk '{print $1}')
+  TAGS=$(echo $NODEINFO | awk -F"Tags: " '{print $2}')
+  SHARD=$(echo $TAGS | sed -E "s/[a-zA-Z]+_//" | sed -E "s/([0-9])_[a-zA-Z]+$/\1/")
+  if [[ $SHARD == "sq_*" ]]; then
+    IS_SIDEKIQ="YES"
+  else
+    IS_SIDEKIQ="NO"
+  fi
+
+  if [[ $SHARD == "primary_master" ]]; then
+    SHARD="primary"
+  fi
+
+  REDIS_SLAVE_AZ=$(aws ec2 describe-instances --filters "Name=tag:Name,Values=$nodename" --query "Reservations[].Instances[].Placement.AvailabilityZone" --output text)
+  SUBNET_ID=$(aws ec2 describe-instances --filters "Name=tag:Name,Values=$nodename" --query "Reservations[].Instances[].SubnetId" --output text)
+  OLDIPADDR=$(aws ec2 describe-instances --filters "Name=tag:Name,Values=$nodename" --query "Reservations[].Instances[].PrivateIpAddress" --output text)
+  INSTANCE_ID=$(aws ec2 describe-instances --filters "Name=tag:Name,Values=$nodename" --query "Reservations[].Instances[].InstanceId" --output text)
+  OLD_INSTANCE_TYPE=$(aws ec2 describe-instances --filters "Name=tag:Name,Values=$nodename" --query "Reservations[].Instances[].InstanceType" --output text)
+}
+
+
+tail_redis_log() {
+  hostip=$1
+  type=$2
+
+  REDIS_LOG_PATH="/var/log/redis/${SHARD}.log"
+  SSH="ssh ${USER}@${hostip}"
+  SSHCMD="tail $REDIS_LOG_PATH"
+
+  if [[ $type == "short" ]]; then
+    GREPCMD="'Background saving terminated with success'"
+    mycmd="${SSH} ${SSHCMD} | grep ${GREPCMD}"
+    echo $mycmd
+    ssh_res=$(${mycmd})
+    echo "ssh_res=${ssh_res}"
+    echo ""
+    echo ""
+    echo ""
+    echo "ssh_res=$ssh_res"
+    echo ""
+    echo ""
+    echo ""
+    eval $SCMD
+    echo ">>>ssh_res<<< $ssh_res"
+
+    if [[ -z "$ssh_res" ]]; then
+      echo "!!! I was unable to tail the remote redis log.  I do not know the sync status.  Aborting!!"
+      exit
+    else
+      echo "ssh_res=${ssh_res}"
+    fi
+  else
+    mycmd="${SSH} ${SSHCMD}"
+    eval ${mycmd}
+  fi
+}
+
+
+stop_monitoring_old_redis_master() {
+
+
+  for sh in "${SENTINEL_HOSTS[@]}"
+    do
+      REDIS_CONNECT="redis-cli -h ${sh} -p ${REDIS_PORT} "
+      REDIS_RESET_CMD="sentinel reset ${SHARD}"
+      REDIS_R_CMD="${REDIS_CONNECT} ${REDIS_RESET_CMD}"
+      echo "${REDIS_R_CMD}"
+      reset_status="$(${REDIS_R_CMD})"
+    done
+}
+
+
+remove_chef_node() {
+  knode_delete=$(knife node delete ${OLDNODENAME})
+  kclient_delete=$(knife client delete ${OLDNODENAME})
+}
+
+
+failover_command() {
+  OK=$1
+
+  if [[ ${OK} == 'OK' ]]; then
+    echo "...connecting redis-cli to ${SH} for shard ${SHARD}"
+    REDIS_CONNECT="redis-cli -h ${SH} -p ${REDIS_PORT} "
+    REDIS_FAILOVER_CMD="sentinel failover ${SHARD}"
+    REDIS_MASTER_CMD="sentinel master ${SHARD}"
+    REDIS_SLAVES_CMD="sentinel slaves ${SHARD}"
+    REDIS_FO_CMD="${REDIS_CONNECT} ${REDIS_FAILOVER_CMD}"
+
+    REDIS_CHECK_FO_STATUS_CMD="${REDIS_CONNECT} ${REDIS_MASTER_CMD}"
+    fo_status_ip="$(${REDIS_CHECK_FO_STATUS_CMD} | head -4 | tail -1)"
+    fo_status_status="$(${REDIS_CHECK_FO_STATUS_CMD} | head -10 | tail -1)"
+
+    echo "STATUS CMD:  ${REDIS_CHECK_FO_STATUS_CMD}"
+    echo "FO IP ==     ${fo_status_ip}"
+    echo "FO STATUS == ${fo_status_status}"
+
+    fo_cmd_status="$(${REDIS_FO_CMD})"
+    echo "${REDIS_FO_CMD} initiated..."
+    echo "status = ${fo_cmd_status}"
+
+    ### check failover status... should wait until "in_progress" flag is gone...
+
+    fo_status_ip="$(${REDIS_CHECK_FO_STATUS_CMD} | head -4 | tail -1)"
+    fo_status_status="$(${REDIS_CHECK_FO_STATUS_CMD} | head -10 | tail -1)"
+    echo "STATUS CMD:  ${REDIS_CHECK_FO_STATUS_CMD}"
+    echo "FO IP ==     ${fo_status_ip}"
+    echo "FO STATUS == ${fo_status_status}"
+
+    waiting "waiting for in progress flag to disappear..." 10
+
+    fo_status_ip="$(${REDIS_CHECK_FO_STATUS_CMD} | head -4 | tail -1)"
+    fo_status_status="$(${REDIS_CHECK_FO_STATUS_CMD} | head -10 | tail -1)"
+    echo "STATUS CMD:  ${REDIS_CHECK_FO_STATUS_CMD}"
+    echo "FO IP ==     ${fo_status_ip}"
+    echo "FO STATUS == ${fo_status_status}"
+
+
+  fi
+}
+
+
+terminate_old_instance() {
+  echo "TERMINATING INSTANCE: ${INSTANCE_ID}"
+  status="$(aws ec2 terminate-instances --instance-ids ${INSTANCE_ID})"
+  echo "status = ${status}"
+}
+
+
+redis_commands() {
+  type=$1
+  msg=$2
+
+  echo "=== ${msg} ==="
+  echo "...connecting redis-cli to ${SH} for shard ${SHARD}"
+  REDIS_CONNECT="redis-cli -h ${SH} -p ${REDIS_PORT} "
+  REDIS_MASTER_CMD="sentinel master ${SHARD}"
+  REDIS_SLAVES_CMD="sentinel slaves ${SHARD}"
+  REDIS_CMD1="${REDIS_CONNECT} ${REDIS_MASTER_CMD}"
+  REDIS_CMD2="${REDIS_CONNECT} ${REDIS_SLAVES_CMD}"
+  echo "MASTER: ${REDIS_CMD1}:"
+  eval ${REDIS_CMD1}
+  echo ""
+  echo "SLAVES: ${REDIS_CMD2}:"
+  eval ${REDIS_CMD2}
+
+  if [[ $type == "old" ]]; then
+    redip="$(${REDIS_CMD1} | head -4 | tail -1)"
+    redmaster="$(${REDIS_CMD1} | head -10 | tail -1)"
+    rednumslaves="$(${REDIS_CMD1} | head -32 | tail -1)"
+    redslaveip="$(${REDIS_CMD2} | head -4 | tail -1)"
+    if [[ -z "$redip" ]]; then
+      echo "!!! was not able to read master redis sentinel !!!"
+      exit
+    else
+      OLDREDMASTER="${redip}"
+      OLDREDNUMSLAVES="${rednumslaves}"
+      OLDREDSLAVE="${redslaveip}"
+    fi
+  fi
+
+  if [[ $type == "new" ]]; then
+    echo "looking for new node in slaves..."
+    OK_TO_FAIL_OVER="NO"
+    GREP4STRING="${NEWIPADDR}:6379"
+    REDIS_CMD3="x=$(${REDIS_CMD2} | grep ${GREP4STRING})"
+    eval ${REDIS_CMD3}
+      if [[ -z "$x" ]]; then
+        echo "!!! I do not see the newly bootstrapped node... I cannot continue !!! aborting!!!"
+        exit
+      else
+        echo "*** NODE ${NEWIPADDR} exists as a slave to the master returned ${x}***"
+        OK_TO_FAIL_OVER="YES"
+      fi
+  fi
+  echo ""
+}
+
+
+rerun_chef_client() {
+  ip=$1
+
+  echo "user=${USER}"
+  echo "ip addr of host=${ip}"
+
+  chef_cmd="ssh ${USER}@${ip} 'sudo chef-client'"
+
+  eval ${chef_cmd}
+}
+
+
+is_new_node_in_slaves_list() {
+  msg=$1
+  redis_commands "new" $msg
+}
+
+
+is_new_node_a_slave_to_master() {
+  echo ""
+}
+
+
+check_new_instance() {
+  redis_commands "new" "AFTER"
+  display_info
+  if [[ ${USE_DB} == "YES" ]]; then
+    insert_data
+  fi
+}
+
+
+check_time() {
+  currenttime=$(date +%H:%M)
+
+    if [[ "$currenttime" > "17:00" ]] && [[ "$currenttime" < "18:00" ]]; then
+      echo "A"
+      usage ${currenttime}
+     else
+       if [[ "$currenttime" > "*:55" ]] && [[ "$currenttime" < "*:05" ]]; then
+         echo "B"
+         usage $currenttime
+       else
+         if [[ "$currenttime" > "*:25" ]] && [[ "$currenttime" < "*:35" ]]; then
+             echo "C"
+             usage ${currenttime}
+         else
+           #echo "it is okay to run based on current time"
+           echo ""
+         fi
+       fi
+    fi
+}
+
+
+failover() {
+	redis_commands "new" "OK To Failover"
+	if [[ ${OK_TO_FAIL_OVER} == "YES" ]]; then
+	  echo "OK to Failover..."
+	  failover_command "OK"
+	fi
+}
+
+
+menu() {
+  echo " 0. exit"
+  echo " 1. set user id"
+  echo " 2. read new input"
+  echo " 3. display info"
+  echo " 4. sentinel hosts"
+  echo " 5. redis commands"
+  echo " 6. old redis master info"
+  echo " 7. generate bootstrap command"
+  echo " 8. run bootstrap command"
+  echo " 9. wait for new instance to come online"
+  echo "10. re-run chef client on new instance"
+  echo "11. check newly bootstrapped node recognized as slave"
+  echo "13. tail bootstrapped instance to insure data sync complete"
+  echo "14. failover to the new instance"
+  echo "15. remove the replaced node"
+  echo "16. terminate old instance"
+  echo "17. stop monitoring old redis master"
+}
+
+get_options() {
+  local choice
+  read -p "enter your choice..." choice
+  echo ""
+
+  case $choice in
+    0) exit ;;
+    1)
+       read -p 'Enter username: ' USER
+       ;;
+    2)
+       input_info
+       nodeinfo $OLDNODENAME
+       sentinel_hosts
+       ;;
+    3) display_info ;;
+    4) echo "Using: $SH"
+       echo "Sentinel Host List: $SL"
+       ;;
+    5)
+       redis_commands "old" "Testing"
+       ;;
+    6)
+       echo "OLD REDIS MASTER  : ${OLDREDMASTER}"
+       echo "OLD REDIS SLAVES #: ${OLDREDNUMSLAVES}"
+       echo "OLD REDIS SLAVE   : ${OLDREDSLAVE}"
+       ;;
+    7)
+       CMD="FLAVOR=$FLAVOR EBS=$EBS EBS_SIZE=$EBS_SIZE REDIS_SLAVE_AZ=$REDIS_SLAVE_AZ SLAVE_SUB=$SUBNET_ID $PATH_TO_ABOPS/$BOOTSTRAP_CMD $NAME $ENVIRON $SHARD"
+       override_bootstrap_command
+       echo "$CMD"
+       ;;
+    8)
+       CMD="FLAVOR=$FLAVOR EBS=$EBS EBS_SIZE=$EBS_SIZE REDIS_SLAVE_AZ=$REDIS_SLAVE_AZ SLAVE_SUB=$SUBNET_ID $PATH_TO_ABOPS/$BOOTSTRAP_CMD $NAME $ENVIRON $SHARD"
+       echo "$CMD"
+       eval $CMD
+       NEWIPADDR=$(aws ec2 describe-instances --filters "Name=tag:Name,Values=$NEWNODENAME" --query "Reservations[].Instances[].PrivateIpAddress" --output text)
+       ;;
+    9)
+       echo "waiting for new bootstrapped instance to come online..."
+       NEWIPADDR=""
+       while :
+         do
+           NEWIPADDR=$(aws ec2 describe-instances --filters "Name=tag:Name,Values=$NEWNODENAME" --query "Reservations[].Instances[].PrivateIpAddress" --output text)
+	   if [[ -z $NEWIPADDR ]]; then
+	     echo -n "."
+	   else
+             echo ""
+	     echo "NEW Instance is online: ${NEWIPADDR}"
+	     break
+	   fi
+         done
+       ;;
+    10)
+       rerun_chef_client ${NEWIPADDR}
+       ;;
+    11)
+       check_new_instance
+       ;;
+    13)
+       tail_redis_log ${NEWIPADDR} "long"
+       ;;
+    14)
+       failover
+       ;;
+    15)
+       remove_chef_node
+       ;;
+    16)
+       terminate_old_instance
+       ;;
+    17)
+       stop_monitoring_old_redis_master
+       ;;
+    *) echo "error...unknown..." && sleep 2
+  esac
+}
+
+# main #
+
+check_time
+
+while (True)
+do
+  menu
+  get_options
+done
